@@ -1,0 +1,173 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import json
+import time
+import logging
+from datetime import datetime, timedelta
+import requests
+import urllib3
+from elasticsearch import Elasticsearch
+
+# 禁用 SSL 证书验证警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+class WeChatWorkAlerter:
+    """企业微信报警器"""
+    def __init__(self, corpid, corpsecret, agentid, chatid):
+        self.corpid = corpid
+        self.corpsecret = corpsecret
+        self.agentid = agentid
+        self.chatid = chatid
+        self.token_expire_time = None
+        self.access_token = None
+
+    def _get_access_token(self):
+        """获取Access Token（带缓存机制）"""
+        if self.access_token and self.token_expire_time and datetime.now() < self.token_expire_time:
+            return self.access_token
+
+        url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={self.corpid}&corpsecret={self.corpsecret}"
+        try:
+            response = requests.get(url, timeout=10, verify=False)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data["errcode"] == 0:
+                self.access_token = data["access_token"]
+                self.token_expire_time = datetime.now() + timedelta(seconds=data["expires_in"] - 300)
+                return self.access_token
+            
+            logger.error(f"获取Token失败: {data['errmsg']}")
+        except Exception as e:
+            logger.error(f"[Token Error] {str(e)}")
+        return None
+
+    def send_alert(self, message):
+        """发送报警消息（带重试机制）"""
+        for attempt in range(3):
+            token = self._get_access_token()
+            if not token:
+                time.sleep(2 ** attempt)
+                continue
+
+            url = f"https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token={token}"
+            payload = {
+                "chatid": self.chatid,
+                "msgtype": "text",
+                "text": {"content": message},
+                "safe": 0
+            }
+
+            try:
+                response = requests.post(url, json=payload, timeout=10, verify=False)
+                response.raise_for_status()
+                result = response.json()
+                
+                if result["errcode"] == 0:
+                    logger.info(f"[WeChat] 报警发送成功（尝试次数：{attempt+1}）")
+                    return True
+                logger.error(f"[WeChat Error] {result.get('errmsg', '未知错误')}")
+            except Exception as e:
+                logger.error(f"[Network Error] 请求异常：{str(e)}")
+            
+            time.sleep(1)
+        return False
+
+class PacketLossMonitor:
+    """推流丢包监控器"""
+    def __init__(self, es_hosts, wechat_alerter):
+        self.es = Elasticsearch(hosts=es_hosts, timeout=30)
+        self.wechat_alerter = wechat_alerter
+        self.last_alert_time = None
+        self.alert_cooldown = timedelta(minutes=5)
+
+    def build_query(self):
+        """构建ES查询语句"""
+        return {
+            "query": {
+                "bool": {
+                    "must": [{"match": {"packet_loss": 100}}],
+                    "filter": [{"range": {"@timestamp": {"gte": "now-1m/m", "lte": "now/m"}}}]
+                }
+            },
+            "aggs": {
+                "hosts": {
+                    "terms": {"field": "host.name.keyword", "size": 50},
+                    "aggs": {"latest": {"top_hits": {"size": 1, "sort": [{"@timestamp": "desc"}]}}}
+                }
+            }
+        }
+
+    def format_message(self, host_data):
+        """格式化报警消息"""
+        source = host_data["latest"]["hits"]["hits"][0]["_source"]
+        timestamp = datetime.strptime(source["@timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ") + timedelta(hours=8)
+        timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        
+        return (
+            " 推流丢包告警 \n"
+            "========================\n"
+            "直播间主机: {host}\n"
+            "服务端域名: {target}\n"
+            "服务端IP: {ip}\n"
+            "当前丢包率: {packet_loss}%\n"
+            "最近时间: {timestamp}\n"
+            "累计次数: {count}次\n"
+            "========================\n"
+            "请立即检查网络连接！"
+        ).format(
+            host=source.get("host", {}).get("name", "N/A"),
+            target=source.get("target", "N/A"),
+            ip=source.get("ip", "N/A"),
+            packet_loss=source.get("packet_loss", 100),
+            timestamp=timestamp_str,
+            count=host_data["doc_count"]
+        )
+
+    def check_and_alert(self):
+        """执行检查并发送告警"""
+        try:
+            response = self.es.search(index="live-push-pc-*", body=self.build_query(), size=0)
+            if response["hits"]["total"]["value"] == 0:
+                return
+
+            current_time = datetime.now()
+            if self.last_alert_time and (current_time - self.last_alert_time) < self.alert_cooldown:
+                logger.info(f" 静默期至 {self.last_alert_time + self.alert_cooldown}")
+                return
+
+            for host in response["aggregations"]["hosts"]["buckets"]:
+                message = self.format_message(host)
+                if self.wechat_alerter.send_alert(message):
+                    self.last_alert_time = current_time
+                time.sleep(1)
+        except Exception as e:
+            logger.error(f"[ES Error] 监控异常: {str(e)}")
+
+    def run(self):
+        """启动监控服务"""
+        logger.info("推流丢包监控已启动")
+        while True:
+            self.check_and_alert()
+            time.sleep(60)
+
+if __name__ == "__main__":
+    WECHAT_CONFIG = {
+        "corpid": "aaaaaaaaaaa",
+        "corpsecret": "bbbbbbbbbbbbbbbbbbbbbbbb",
+        "agentid": "1000000",
+        "chatid": "cccccccccccccccccccc"
+    }
+    ES_HOSTS = ["http://x.x.x.x:9200"]
+
+    wechat_alerter = WeChatWorkAlerter(**WECHAT_CONFIG)
+    monitor = PacketLossMonitor(ES_HOSTS, wechat_alerter)
+    
+    try:
+        monitor.run()
+    except KeyboardInterrupt:
+        logger.info("监控服务已停止")
